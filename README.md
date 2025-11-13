@@ -104,8 +104,8 @@ ab -n 100000 -c 2000 http://127.0.0.1:8080/
 
 ## 🧑‍💻 作者
 **Huolong**  
-- 📫 Email: your.email@example.com  
-- 💼 GitHub: [github.com/huolong](https://github.com/huolong)  
+- 📫 Email: 1281342986@qq.com  
+- 💼 GitHub: [github.com/03jingjing](https://github.com/03jingjing)  
 - 🧠 兴趣方向：C++ 服务端开发 / 网络编程 / 高性能系统设计  
 
 ---
