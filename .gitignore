@@ -1,0 +1,8 @@
+# Build outputs
+build/
+*.o
+*.a
+*.log
+
+# Editor files
+.vscode/
