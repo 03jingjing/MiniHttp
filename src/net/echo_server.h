@@ -1,0 +1,46 @@
+#pragma once
+#include <string>
+#include <cstdint>
+
+class EchoServer
+{
+public:
+    explicit EchoServer(int port = 8080);
+    // 阻塞运行事件循环（单线程）
+    void run();
+
+private:
+    int listen_fd_ = -1;
+    int epfd_ = -1;
+    int port_ = 8080;
+
+    // 初始化监听 socket 与 epoll
+    void init_listen();
+    void init_epoll();
+
+    // 事件处理
+    void handle_accept();
+    void handle_read(int fd);
+    void handle_write(int fd);
+
+    // 工具
+    // 把 fd 设成非阻塞：read/write 立刻返回，没数据时 errno=EAGAIN
+    static void set_nonblock(int fd);
+    // SO_REUSEADDR/PORT，端口复用，避免 TIME_WAIT 绑定失败
+    static void set_reuseaddr(int fd);
+    // epoll_ctl(ADD...)，把fd加入epoll关注
+    static void add_fd(int epfd, int fd, uint32_t events);
+    // epoll_ctl(MOD...)，修改fd关注的事件集合
+    static void mod_fd(int epfd, int fd, uint32_t events);
+    // epoll_ctl(DEL...)，从epoll移除
+    static void del_fd(int epfd, int fd);
+    // 提取首行: "GET /path HTTP/1.1"
+    static bool parse_request_line(const std::string &header,
+                                   std::string &method,
+                                   std::string &path,
+                                   std::string &version);
+    // 构造最小 HTTP 响应
+    static std::string make_http_response(const std::string &body,
+                                          const std::string &content_type,
+                                          bool keep_alive);
+};
