@@ -34,13 +34,30 @@ private:
     static void mod_fd(int epfd, int fd, uint32_t events);
     // epoll_ctl(DEL...)，从epoll移除
     static void del_fd(int epfd, int fd);
+    // 关闭连接清理缓存区
+    void close_conn(int fd);
     // 提取首行: "GET /path HTTP/1.1"
     static bool parse_request_line(const std::string &header,
                                    std::string &method,
                                    std::string &path,
                                    std::string &version);
     // 构造最小 HTTP 响应
-    static std::string make_http_response(const std::string &body,
+    static std::string make_http_response(const int status,
                                           const std::string &content_type,
+                                          const std::string &body,
                                           bool keep_alive);
+    // 解析body
+    static std::string extract_json_field(const std::string &body,
+                                          const std::string &key);
+
+    // 从完整 header 文本中找到某一行 "Key: Value" 并返回 Value（去掉前后空格）
+    static bool get_header_value(const std::string &header,
+                                 const std::string &key,
+                                 std::string &value_out);
+    // 统一发送HTTP响应
+    void queue_response(int fd,
+                        int status,
+                        const std::string &content_type,
+                        const std::string &body,
+                        bool keep_alive);
 };

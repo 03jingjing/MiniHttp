@@ -7,9 +7,56 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
 
 #include <iostream>
 #include <unordered_map>
+
+namespace
+{
+    static const std::unordered_map<int, std::string> REASON = {
+        {200, "OK"},
+        {400, "Bad Request"},
+        {401, "Unauthorized"},
+        {404, "Not Found"},
+        {500, "Internal Server Error"},
+    };
+
+    // 用 OpenSSL EVP_EncodeBlock 做 Base64 编码
+    std::string base64_encode(const unsigned char *data, size_t len)
+    {
+        // Base64 输出长度大约是 4 * ((len + 2) / 3)
+        std::string out;
+        out.resize(4 * ((len + 2) / 3));
+
+        int out_len = EVP_EncodeBlock(
+            reinterpret_cast<unsigned char *>(&out[0]),
+            data,
+            static_cast<int>(len));
+        if (out_len < 0)
+            return {};
+
+        out.resize(out_len); // 修正为真实长度
+        return out;
+    }
+
+    // 计算 WebSocket 的 Sec-WebSocket-Accept
+    std::string ws_accept_key(const std::string &client_key)
+    {
+        static const std::string kGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+        std::string src = client_key + kGUID;
+
+        // 1. SHA1
+        unsigned char sha[SHA_DIGEST_LENGTH];
+        SHA1(reinterpret_cast<const unsigned char *>(src.data()), src.size(), sha);
+
+        // 2. Base64
+        return base64_encode(sha, SHA_DIGEST_LENGTH);
+    }
+
+} // namespace
 
 // 简单的连接输出缓冲；生产环境请换循环缓冲区
 static std::unordered_map<int, std::string> g_outbuf;
@@ -63,6 +110,15 @@ void EchoServer::del_fd(int epfd, int fd)
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
 }
 
+void EchoServer::close_conn(int fd)
+{
+    del_fd(epfd_, fd);
+    g_outbuf.erase(fd);
+    g_inbuf.erase(fd);
+    g_close_after_write.erase(fd);
+    ::close(fd);
+}
+
 // 提取首行: "GET /path HTTP/1.1"
 bool EchoServer::parse_request_line(const std::string &header,
                                     std::string &method,
@@ -82,14 +138,20 @@ bool EchoServer::parse_request_line(const std::string &header,
     return true;
 }
 
-// 构造最小 HTTP 响应
-std::string EchoServer::make_http_response(const std::string &body,
+// 构造 HTTP 响应
+std::string EchoServer::make_http_response(const int status,
                                            const std::string &content_type,
+                                           const std::string &body,
                                            bool keep_alive)
 {
+    // 1. 状态码 -> reason phrase
+    auto it = REASON.find(status);
+    std::string reason = (it != REASON.end()) ? it->second : "OK";
+
+    // 2. 构造响应
     std::string res;
-    res += "HTTP/1.1 200 OK\r\n";
-    res += "Content-Type: " + std::to_string(content_type.size())+ "\r\n";
+    res += "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
+    res += "Content-Type: " + content_type + "\r\n";
     res += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     if (keep_alive)
     {
@@ -101,7 +163,81 @@ std::string EchoServer::make_http_response(const std::string &body,
     }
     res += "\r\n";
     res += body;
+
     return res;
+}
+
+std::string EchoServer::extract_json_field(const std::string &body,
+                                           const std::string &key)
+{
+    // 假设格式是 {"key":"value",...}
+    std::string pat = "\"" + key + "\"";
+    auto pos = body.find(pat);
+    if (pos == std::string::npos)
+        return "";
+
+    pos = body.find(':', pos + pat.size());
+    if (pos == std::string::npos)
+        return "";
+
+    // 跳过冒号和可能的空格
+    ++pos;
+    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\"'))
+        ++pos;
+
+    // 收集值字符，直到结束符
+    std::string val;
+    while (pos < body.size() && body[pos] != '\"' && body[pos] != ',' && body[pos] != '}')
+    {
+        val.push_back(body[pos]);
+        ++pos;
+    }
+    return val;
+}
+
+bool EchoServer::get_header_value(const std::string &header,
+                                  const std::string &key,
+                                  std::string &value_out)
+{
+    // 例如 "Content-Length:" 或 "Sec-WebSocket-Key:"
+    std::string prefix = key + ":";
+    size_t start = 0;
+    while (true)
+    {
+        size_t end = header.find("\r\n", start);
+        if (end == std::string::npos)
+            break;
+        std::string line = header.substr(start, end - start);
+
+        // 这里只匹配以 prefix 开头的行
+        if (line.rfind(prefix, 0) == 0)
+        {
+            // 拿冒号后面的内容
+            std::string val = line.substr(prefix.size());
+            // 去掉前面的空格
+            size_t p = 0;
+            while (p < val.size() && (val[p] == ' ' || val[p] == '\t'))
+                ++p;
+            val = val.substr(p);
+            value_out = val;
+            return true;
+        }
+        start = end + 2;
+    }
+    return false;
+}
+
+// 统一发送HTTP响应
+void EchoServer::queue_response(int fd,
+                                int status,
+                                const std::string &content_type,
+                                const std::string &body,
+                                bool keep_alive)
+{
+    std::string resp = make_http_response(status, content_type, body, keep_alive);
+    g_outbuf[fd] += resp;
+    g_close_after_write[fd] = !keep_alive;
+    mod_fd(epfd_, fd, EPOLLIN | EPOLLOUT);
 }
 
 void EchoServer::init_listen()
@@ -171,7 +307,9 @@ void EchoServer::handle_accept()
         }
         add_fd(epfd_, cfd, EPOLLIN); // 先关注读事件
         // 可选打印：新连接
-        // std::cerr << "accept fd=" << cfd << "\n";
+        /*
+        std::cerr << "accept fd=" << cfd << "\n";
+        */
     }
 }
 
@@ -196,7 +334,6 @@ void EchoServer::handle_read(int fd)
             // 3) 取出请求头文本
             std::string header = g_inbuf[fd].substr(0, pos + 2); // \r\n 之前的首行和头
             g_inbuf[fd].erase(0, pos + 4);                       // 丢掉整个 header（含 \r\n\r\n）
-            // 我们这个最小版忽略 body（只处理 GET）
 
             // 4) 解析首行
             std::string first_line;
@@ -205,16 +342,116 @@ void EchoServer::handle_read(int fd)
                 first_line = (rn == std::string::npos) ? header : header.substr(0, rn);
             }
             std::string method, path, version;
+            int status = 200;
             if (!parse_request_line(first_line, method, path, version))
             {
                 // 非法请求，简单返回 400
-                std::string bad = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-                g_outbuf[fd] += bad;
-                g_close_after_write[fd] = true;
-                mod_fd(epfd_, fd, EPOLLIN | EPOLLOUT);
+                queue_response(fd,
+                               400,
+                               "text/plain",
+                               "",     // 没 body
+                               false); // 直接关连接
                 continue;
             }
+            std::string resp_body;
+            std::string pure_path = path;
+            std::string name;
+            if (method == "POST")
+            {
+                int content_length = 0;
+                std::string value;
+                if (!get_header_value(header, "Content-Length", value))
+                {
+                    // 没有 Content-Length：这个 POST 我们不认，直接 400
+                    queue_response(
+                        fd,
+                        400,
+                        "application/json",
+                        R"({"error":"missing Content-Length"})",
+                        false);
+                    return;
+                }
+                try
+                {
+                    content_length = std::stoi(value);
+                }
+                catch (...)
+                {
+                    // 非数字，也当 Bad Request
+                    queue_response(
+                        fd,
+                        400,
+                        "application/json",
+                        R"({"error":"invalid Content-Length"})",
+                        false);
+                    return;
+                }
 
+                if (content_length <= 0)
+                {
+                    // 对于 /login 这样的接口，空 body 基本就是错误，用 400 比较合理
+                    queue_response(
+                        fd,
+                        400,
+                        "application/json",
+                        R"({"error":"invalid Content-Length"})",
+                        false);
+                    return;
+                }
+
+                // 删掉 header 之后
+                // g_inbuf[fd] 现在至少包含 0 ~ content_length 字节 body，可能还不全
+                if (g_inbuf[fd].size() < (size_t)content_length)
+                {
+                    // 还没收够 body，先返回，等下一次 EPOLLIN 再读
+                    return;
+                }
+
+                // 保存body
+                std::string body = g_inbuf[fd].substr(0, content_length);
+                // 把 body 从 inbuf 里删掉
+                g_inbuf[fd].erase(0, content_length);
+
+                std::string user = extract_json_field(body, "user");
+                std::string pass = extract_json_field(body, "password");
+                std::cerr << "[LOGIN] user=" << user << " pass=" << pass << "\n";
+                bool ok = (user == "huolong" && pass == "123456");
+
+                if (ok)
+                {
+                    resp_body = R"({"token": "fake-token-123"})";
+                }
+                else
+                {
+                    status = 401;
+                    resp_body = R"({"error": "invalid credentials"})";
+                }
+            }
+            else if (method == "GET")
+            {
+                // 解析查询参数，例如 /hello?name=tom
+                std::string query;
+
+                auto pos_q = path.find('?');
+                if (pos_q != std::string::npos)
+                {
+                    pure_path = path.substr(0, pos_q); // /hello
+                    query = path.substr(pos_q + 1);    // name=tom
+                }
+                name = "anonymous";
+                if (!query.empty())
+                {
+                    auto pos_name = query.find("name=");
+                    if (pos_name != std::string::npos)
+                    {
+                        auto start = pos_name + 5; // 跳过 "name="
+                        auto end = query.find('&', start);
+                        if (end == std::string::npos)
+                            end = query.size();
+                        name = query.substr(start, end - start);
+                    }
+                }
+            }
             // 5) 是否 keep-alive：HTTP/1.1 默认 keep-alive，若头里带 close 就关闭
             bool keep_alive = (version == "HTTP/1.1");
             if (header.find("Connection: close") != std::string::npos ||
@@ -226,45 +463,42 @@ void EchoServer::handle_read(int fd)
             // 6) 构造响应体（这里固定返回一个简单页面；可根据 path 定制）
             std::string body;
             std::string content_type = "text/html; charset=utf-8";
-
             // 简单路由
-            if (path == "/")
+            if (pure_path == "/")
             {
-                body =
-                    "<!doctype html><html><body>"
-                    "<h3>MiniHTTP is running 🎯</h3>"
-                    "<p>Method: " +
-                    method + " Path: " + path + "</p>"
-                                                "</body></html>";
+                // 返回首页 HTML
+                body = "<html>...</html>";
                 content_type = "text/html; charset=utf-8";
             }
-            else if (path == "/ping")
+            else if (pure_path == "/ping")
             {
                 body = R"({"msg": "pong"})"; // 原始字符串字面量
+                content_type = "application/json";
+            }
+            else if (pure_path == "/hello")
+            {
+                body = R"({"msg": "hello, )" + name + R"("})";
+                content_type = "application/json";
+            }
+            else if (pure_path == "/login" && method == "POST")
+            {
+                // resp_body是前面处理过login时的token
+                body = resp_body;
                 content_type = "application/json";
             }
             else
             {
                 body = R"({"error": "not found"})";
                 content_type = "application/json";
-                // 这里其实应该返回 404 状态码，先偷懒返回 200 OK
+                status = 404;
             }
 
-            std::string resp = make_http_response(body, content_type, keep_alive);
-            g_outbuf[fd] += resp;
-            g_close_after_write[fd] = !keep_alive;
-
-            // 7) 关心可写，把响应发出去
-            mod_fd(epfd_, fd, EPOLLIN | EPOLLOUT);
+            queue_response(fd, status, content_type, body, keep_alive);
         }
         else if (n == 0)
         {
             // 对端关闭
-            del_fd(epfd_, fd);
-            g_outbuf.erase(fd);
-            g_inbuf.erase(fd);
-            g_close_after_write.erase(fd);
-            ::close(fd);
+            close_conn(fd);
             break;
         }
         else
@@ -273,11 +507,7 @@ void EchoServer::handle_read(int fd)
                 break;
             if (errno == EINTR)
                 continue;
-            del_fd(epfd_, fd);
-            g_outbuf.erase(fd);
-            g_inbuf.erase(fd);
-            g_close_after_write.erase(fd);
-            ::close(fd);
+            close_conn(fd);
             break;
         }
     }
@@ -310,9 +540,7 @@ void EchoServer::handle_write(int fd)
             if (errno == EINTR)
                 continue;
             // 其他错误：关闭
-            del_fd(epfd_, fd);
-            g_outbuf.erase(fd);
-            ::close(fd);
+            close_conn(fd);
             return;
         }
         else
@@ -326,11 +554,7 @@ void EchoServer::handle_write(int fd)
     {
         if (g_close_after_write[fd])
         {
-            del_fd(epfd_, fd);
-            g_outbuf.erase(fd);
-            g_inbuf.erase(fd);
-            g_close_after_write.erase(fd);
-            ::close(fd);
+            close_conn(fd);
             return;
         }
         mod_fd(epfd_, fd, EPOLLIN);
@@ -369,9 +593,7 @@ void EchoServer::run()
             }
             if (ev & (EPOLLHUP | EPOLLERR))
             {
-                del_fd(epfd_, fd);
-                g_outbuf.erase(fd);
-                ::close(fd);
+                close_conn(fd);
                 continue;
             }
             if (ev & EPOLLIN)

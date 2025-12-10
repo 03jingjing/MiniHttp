@@ -11,3 +11,7 @@ target_include_directories(minihttp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_
 
 # 把顶层的 PROJECT_VERSION 传给代码使用
 target_compile_definitions(minihttp PRIVATE PROJECT_VERSION="${PROJECT_VERSION}")
+
+find_package(OpenSSL REQUIRED)
+
+target_link_libraries(minihttp PRIVATE OpenSSL::SSL OpenSSL::Crypto)
