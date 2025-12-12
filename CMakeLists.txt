@@ -14,3 +14,4 @@ endif()
 
 add_subdirectory(src)   # 交给 src/CMakeLists.txt 生成可执行文件
 
+file(COPY ${CMAKE_SOURCE_DIR}/www DESTINATION ${CMAKE_BINARY_DIR})

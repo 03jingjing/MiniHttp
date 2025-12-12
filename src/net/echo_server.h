@@ -13,6 +13,7 @@ private:
     int listen_fd_ = -1;
     int epfd_ = -1;
     int port_ = 8080;
+    std::string doc_root_ = "./www"; // 前端文件路径
 
     // 初始化监听 socket 与 epoll
     void init_listen();
@@ -22,6 +23,9 @@ private:
     void handle_accept();
     void handle_read(int fd);
     void handle_write(int fd);
+
+    // WebSocket 帧读取/处理
+    void handle_websocket_read(int fd);
 
     // 工具
     // 把 fd 设成非阻塞：read/write 立刻返回，没数据时 errno=EAGAIN
@@ -41,11 +45,17 @@ private:
                                    std::string &method,
                                    std::string &path,
                                    std::string &version);
-    // 构造最小 HTTP 响应
-    static std::string make_http_response(const int status,
-                                          const std::string &content_type,
-                                          const std::string &body,
-                                          bool keep_alive);
+    // 构造HTTP响应
+    std::string make_http_response(const int status,
+                                   const std::string &content_type,
+                                   const std::string &body,
+                                   bool keep_alive);
+    // 发送HTTP响应
+    void queue_response(int fd,
+                        int status,
+                        const std::string &content_type,
+                        const std::string &body,
+                        bool keep_alive);
     // 解析body
     static std::string extract_json_field(const std::string &body,
                                           const std::string &key);
@@ -54,10 +64,15 @@ private:
     static bool get_header_value(const std::string &header,
                                  const std::string &key,
                                  std::string &value_out);
-    // 统一发送HTTP响应
-    void queue_response(int fd,
-                        int status,
-                        const std::string &content_type,
-                        const std::string &body,
-                        bool keep_alive);
+    // 升级webserve
+    static bool is_websocket_handshake(const std::string &method,
+                                       const std::string &path,
+                                       const std::string &header,
+                                       std::string &client_key_out);
+    // Webserve - 构造帧
+    std::string make_ws_text_frame(const std::string &msg);
+    // Webserve - 发送帧
+    void send_ws_text(int fd, const std::string &msg);
+    // 广播函数：给所有 WebSocket 客户端发消息
+    void broadcast_ws_text(const std::string &msg);
 };

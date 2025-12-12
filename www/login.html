@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>MiniHTTP Chat</title>
+</head>
+
+<body>
+  <!-- 登录区 -->
+  用户: <input id="user"><br>
+  密码: <input id="pass" type="password"><br>
+  <button id="loginBtn">Login</button>
+
+  <!-- 聊天区 -->
+  <div id="status"></div>
+  <input id="msgInput">
+  <button id="sendBtn">Send</button>
+
+  <pre id="log"></pre>
+
+  <script>
+
+    // 1. 先获取 DOM 元素
+    const userInput = document.getElementById("user");
+    const passInput = document.getElementById("pass");
+    const loginBtn = document.getElementById("loginBtn");
+
+    const statusDiv = document.getElementById("status");
+    const msgInput = document.getElementById("msgInput");
+    const sendBtn = document.getElementById("sendBtn");
+    const logPre = document.getElementById("log");
+
+    // 2. 全局变量（token、ws）
+    let token = null;
+    let ws = null;
+
+    // 3. WebSocket 连接函数
+    function connectWs() {
+      if (!token) {
+        statusDiv.innerText = "没有 token，不能进入聊天室";
+        return;
+      }
+
+      const url = "ws://" + window.location.host + "/chat?token=" + encodeURIComponent(token);
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        statusDiv.innerText = "WebSocket 已连接，正在进入聊天室...";
+      };
+
+      ws.onmessage = (ev) => {
+        logPre.textContent += "recv: " + ev.data + "\n";
+      };
+
+      ws.onclose = (ev) => {
+        statusDiv.innerText = "WebSocket 已关闭 code=" + ev.code + " reason=" + ev.reason;
+        console.log("WS close event:", ev);
+      };
+
+    }
+
+    // 4. 登录按钮逻辑
+    loginBtn.onclick = async () => {
+      const user = userInput.value;
+      const pass = passInput.value;
+
+      statusDiv.innerText = "正在登录...";
+
+      try {
+        const resp = await fetch("/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user: user,
+            password: pass
+          })
+        });
+
+        const data = await resp.json();
+
+        if (resp.status === 200) {
+          token = data.token;
+          statusDiv.innerText = "登录成功";
+
+          // ⭐ 登录成功后立即进入聊天室
+          connectWs();
+
+        } else {
+          statusDiv.innerText = "登录失败：" + (data.error || "unknown");
+        }
+
+      } catch (err) {
+        statusDiv.innerText = "网络错误：" + err;
+      }
+    };
+
+    // 5. Send 按钮逻辑（放在 script 任意位置都可以，只要在 sendBtn 定义之后）
+    sendBtn.onclick = () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        alert("WebSocket 未连接");
+        return;
+      }
+
+      const msg = msgInput.value;
+      if (!msg) return;
+
+      ws.send(msg);
+      msgInput.value = "";
+    };
+
+  </script>
+
+</body>
+
+</html>
